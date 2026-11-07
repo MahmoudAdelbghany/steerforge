@@ -130,6 +130,9 @@ steerforge serve evil.persona
 # Transformers: built-in OpenAI-compatible server with hooks
 steerforge serve evil.persona --backend transformers --port 8080
 
+# vLLM with the EasySteer fork: startup spec + direct steering
+steerforge serve evil.persona --backend vllm --model Qwen/Qwen3.5-4B --port 8080
+
 # dry run / baseline
 steerforge serve evil.persona --dry-run
 steerforge serve evil.persona --no-steer
@@ -184,10 +187,13 @@ steerforge export evil.persona --out evil.gguf
 | --- | --- | --- | --- |
 | Transformers | yes | yes | forward hooks on decoder layers |
 | llama.cpp | via exported vectors | yes | `--control-vector-scaled` GGUF |
-| vLLM | via exported vectors | needs EasySteer fork | `vllm.steer_vectors` |
+| vLLM | via exported vectors | yes, with EasySteer fork | `--steering-config` + direction GGUF |
 | Ollama / LM Studio | no | no (activation hooks not exposed) | — |
 
-Hosted APIs are not affected: steering needs hidden-state access.
+Hosted APIs are not affected: steering needs hidden-state access. For vLLM,
+`serve` writes the same direction GGUF plus an EasySteer startup spec and launches
+`vllm serve ... --steering-config`. Install EasySteer first; mainline vLLM has no
+activation-steering hooks.
 
 ## How the search works
 

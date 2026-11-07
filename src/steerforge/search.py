@@ -650,9 +650,9 @@ class Discovery:
             samples=samples,
             candidates=candidates,
             notes=(
-                "Keyword rates are derived from the contrastive dataset. "
-                "Perplexity is measured on a small neutral corpus and is a relative "
-                "coherence signal, not a benchmark."
+                "Trait scores combine dataset-derived keywords with a linear probe on "
+                "the model's own residual direction. Perplexity is measured on a small "
+                "neutral corpus and is a relative coherence signal, not a benchmark."
             ),
         )
 

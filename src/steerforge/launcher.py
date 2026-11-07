@@ -118,6 +118,7 @@ def build_llamacpp_command(
     *,
     control_vector: str | Path,
     command: Sequence[str] | None = None,
+    model: str | None = None,
     host: str | None = None,
     port: int | None = None,
     scale: float = 1.0,
@@ -145,7 +146,10 @@ def build_llamacpp_command(
             base += ["-m", persona.serve.model]
     if not base:
         raise RuntimeError("empty llama.cpp command")
-    if not any(flag in base for flag in ("-m", "--model", "-hf", "--hf-repo", "--hf")):
+    if model:
+        base = _remove_option(base, {"-m", "--model", "-hf", "--hf-repo", "--hf"})
+        base += ["-m", model]
+    elif not any(flag in base for flag in ("-m", "--model", "-hf", "--hf-repo", "--hf")):
         if persona.serve and persona.serve.model:
             base += ["-m", persona.serve.model]
     if host:
@@ -161,20 +165,45 @@ def build_llamacpp_command(
     return base
 
 
+def easy_steer_available() -> bool:
+    import importlib.util
+
+    return (
+        importlib.util.find_spec("vllm.steer_vectors") is not None
+        or importlib.util.find_spec("easysteer") is not None
+    )
+
+
 def build_vllm_command(
     persona: Persona,
     *,
+    steering_config: str | Path | None = None,
     command: Sequence[str] | None = None,
     host: str | None = None,
     port: int | None = None,
     extra_args: Sequence[str] | None = None,
+    no_steer: bool = False,
 ) -> list[str]:
     if command:
-        return list(command) + list(extra_args or [])
-    raise RuntimeError(
-        "vLLM needs a steering-enabled build. Install EasySteer (vLLM fork) and pass "
-        "its server command with --command, or use --backend transformers / llama.cpp."
-    )
+        base = list(command)
+    else:
+        model = persona.serve.model if persona.serve and persona.serve.model else persona.base_model.id
+        base = ["vllm", "serve", model]
+    # SteerForge owns the steering-config flag; replace any previous one.
+    base = _remove_option(base, {"--steering-config"})
+    if host:
+        base = _remove_option(base, {"--host"})
+        base += ["--host", host]
+    if port:
+        base = _remove_option(base, {"--port"})
+        base += ["--port", str(port)]
+    if not no_steer:
+        if not steering_config:
+            raise RuntimeError("vLLM steering requested without a spec")
+        base += ["--steering-config", str(steering_config)]
+    if extra_args:
+        base += list(extra_args)
+    return base
 
 
 def serve_config_from_command(command: str | Sequence[str], *, backend: str | None = None) -> ServeConfig:
@@ -200,7 +229,15 @@ def serve_config_from_command(command: str | Sequence[str], *, backend: str | No
                 port = int(args[args.index(flag) + 1])
             except (IndexError, ValueError):
                 pass
-    return ServeConfig(backend=detected, command=args, model=model, port=port)
+    host = "127.0.0.1"
+    if "--host" in args:
+        try:
+            host = args[args.index("--host") + 1]
+        except IndexError:
+            pass
+    return ServeConfig(
+        backend=detected, command=args, model=model, host=host, port=port
+    )
 
 
 def run_process(command: Sequence[str], *, dry_run: bool = False) -> int:

@@ -55,6 +55,44 @@ def write_control_vector(
     return target
 
 
+def write_easysteer_spec(
+    persona: Persona,
+    vector_path: str | os.PathLike[str],
+    path: str | os.PathLike[str],
+    *,
+    layers: list[int] | None = None,
+    scale: float = 1.0,
+) -> Path:
+    """Write an EasySteer startup spec that points at a direction GGUF.
+
+    EasySteer reads GGUF tensors named ``direction.<layer>``, the same layout
+    used by the llama.cpp exporter.  This makes one persona usable by both
+    llama.cpp and the EasySteer vLLM fork.
+    """
+    import json
+
+    vectors = control_vector_payload(persona)
+    target_layers = layers or [layer for layer in sorted(vectors) if layer >= 0]
+    target_layers = [layer for layer in target_layers if layer in vectors]
+    if not target_layers:
+        raise ValueError("persona has no vectors for EasySteer")
+    spec = {
+        "vectors": [
+            {
+                "source": str(Path(vector_path).resolve()),
+                "algorithm": "direct",
+                "scale": float(scale),
+                "layers": target_layers,
+                "apply": {"prompt": "all", "generation": "all"},
+            }
+        ]
+    }
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    return target
+
+
 def read_control_vector(path: str | os.PathLike[str]) -> dict[int, np.ndarray]:
     """Read a control-vector GGUF back into 0-based layer vectors (for tests)."""
     from gguf import GGUFReader

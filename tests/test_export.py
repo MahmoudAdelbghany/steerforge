@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from steerforge.export import read_control_vector, write_control_vector
+from steerforge.export import read_control_vector, write_control_vector, write_easysteer_spec
 from steerforge.persona import LayerVector, ModelRef, Persona, TraitInfo
 
 
@@ -38,6 +38,19 @@ def test_control_vector_scale(tmp_path):
     path = write_control_vector(make_persona(), tmp_path / "cv.gguf", scale=0.5)
     vectors = read_control_vector(path)
     np.testing.assert_allclose(vectors[3], np.full(16, 0.5, dtype=np.float32), atol=1e-6)
+
+
+def test_easysteer_spec(tmp_path):
+    import json
+
+    persona = make_persona()
+    cv = write_control_vector(persona, tmp_path / "cv.gguf")
+    spec_path = write_easysteer_spec(persona, cv, tmp_path / "spec.json", layers=[1, 3])
+    spec = json.loads(spec_path.read_text())
+    vector = spec["vectors"][0]
+    assert vector["algorithm"] == "direct"
+    assert vector["layers"] == [1, 3]
+    assert vector["source"].endswith("cv.gguf")
 
 
 def test_empty_persona_rejected(tmp_path):

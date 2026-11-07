@@ -4,6 +4,7 @@ import numpy as np
 
 from steerforge.launcher import (
     build_llamacpp_command,
+    build_vllm_command,
     detect_backend,
     serve_config_from_command,
 )
@@ -44,6 +45,19 @@ def test_injects_control_vector_and_keeps_original_args(tmp_path):
     assert result.count("--port") == 1  # existing port wins
 
 
+def test_model_override_replaces_existing_model():
+    persona = make_persona()
+    result = build_llamacpp_command(
+        persona,
+        control_vector="/tmp/x.gguf",
+        command=["llama-server", "-m", "old.gguf", "-c", "4096"],
+        model="new.gguf",
+    )
+    assert "old.gguf" not in result
+    assert result[result.index("-m") + 1] == "new.gguf"
+    assert result.count("-m") == 1
+
+
 def test_no_steer():
     persona = make_persona()
     result = build_llamacpp_command(
@@ -73,6 +87,27 @@ def test_records_serve_command():
     assert cfg.backend == "llama.cpp"
     assert cfg.model == "/models/qwen.gguf"
     assert cfg.port == 9999
+
+
+def test_vllm_command_injects_spec():
+    persona = make_persona()
+    result = build_vllm_command(
+        persona,
+        steering_config="/tmp/evil.spec.json",
+        command=["vllm", "serve", "model", "--port", "9000"],
+        port=8080,
+    )
+    assert result[:3] == ["vllm", "serve", "model"]
+    assert "--steering-config" in result
+    assert "/tmp/evil.spec.json" in result
+    assert result.count("--port") == 1
+    assert "8080" in result
+
+
+def test_vllm_no_steer_omits_spec():
+    persona = make_persona()
+    result = build_vllm_command(persona, command=["vllm", "serve", "model"], no_steer=True)
+    assert "--steering-config" not in result
 
 
 def test_uses_recorded_model():

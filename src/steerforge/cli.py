@@ -25,11 +25,13 @@ from .dataset import (
     save_dataset,
     synthesize_dataset,
 )
-from .export import write_control_vector
+from .export import write_control_vector, write_easysteer_spec
 from .launcher import (
     build_llamacpp_command,
+    build_vllm_command,
     control_vector_cache,
     detect_backend,
+    easy_steer_available,
     find_llama_server,
     normalize_backend,
     run_process,
@@ -594,6 +596,7 @@ def serve_command(
             effective,
             control_vector=cv_path,
             command=existing,
+            model=model,
             host=resolved_host,
             port=resolved_port,
             scale=1.0,
@@ -632,19 +635,41 @@ def serve_command(
         return
 
     if backend == "vllm":
-        console.print(
-            Panel(
-                "vLLM does not expose activation steering in mainline. Use the EasySteer "
-                "vLLM fork and pass its server command with --command, or serve with "
-                "--backend transformers / llama.cpp.",
-                title="vLLM needs EasySteer",
-                border_style="yellow",
+        if not no_steer and not easy_steer_available():
+            console.print(
+                Panel(
+                    "vLLM mainline does not expose activation steering. Install the "
+                    "EasySteer vLLM fork, or serve with --backend transformers / llama.cpp.\n"
+                    "You can still launch a baseline with --no-steer.",
+                    title="vLLM needs EasySteer",
+                    border_style="yellow",
+                )
             )
+            raise typer.Exit(2)
+        model_id = model or (persona.serve.model if persona.serve else None) or persona.base_model.id
+        base_command = existing or ["vllm", "serve", model_id]
+        spec_path = None
+        if not no_steer:
+            cv_path = control_vector_cache(effective)
+            write_control_vector(effective, cv_path, scale=1.0)
+            spec_path = cv_path.with_suffix(".spec.json")
+            write_easysteer_spec(
+                effective,
+                cv_path,
+                spec_path,
+                layers=[layer for layer in effective.vector_layers() if layer >= 1],
+            )
+        final = build_vllm_command(
+            effective,
+            steering_config=spec_path,
+            command=base_command,
+            host=resolved_host,
+            port=resolved_port,
+            extra_args=server_arg,
+            no_steer=no_steer,
         )
-        if no_steer and existing:
-            console.print("baseline requested (--no-steer); launching without steering")
-            raise typer.Exit(run_process(existing, dry_run=dry_run))
-        raise typer.Exit(2)
+        console.print(Panel(shlex.join(final), title="vLLM / EasySteer"))
+        raise typer.Exit(run_process(final, dry_run=dry_run))
 
     raise typer.BadParameter(f"unsupported backend: {backend}")
 

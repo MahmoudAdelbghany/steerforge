@@ -80,6 +80,7 @@ class HFBackend:
             threads = min(4, os.cpu_count() or 4)
         if threads:
             torch.set_num_threads(int(threads))
+        import transformers
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         self.model_id = model_id
@@ -111,9 +112,13 @@ class HFBackend:
         load_kwargs: dict[str, Any] = {
             "revision": revision,
             "trust_remote_code": trust_remote_code,
-            "torch_dtype": torch_dtype,
             "low_cpu_mem_usage": True,
         }
+        try:
+            major = int(transformers.__version__.split(".")[0])
+        except ValueError:
+            major = 4
+        load_kwargs["dtype" if major >= 5 else "torch_dtype"] = torch_dtype
         if attn_implementation:
             load_kwargs["attn_implementation"] = attn_implementation
         if load_in_4bit:
