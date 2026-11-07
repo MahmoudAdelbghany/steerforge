@@ -106,7 +106,9 @@ class HFBackend:
         text_config = getattr(config, "text_config", None) or config
         self.num_layers = int(text_config.num_hidden_layers)
         self.hidden_size = int(text_config.hidden_size)
-        self.intermediate_size = getattr(text_config, "intermediate_size", None)
+        self.intermediate_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
+            text_config, "intermediate_size", None
+        )
 
         torch_dtype = self._resolve_dtype(dtype)
         load_kwargs: dict[str, Any] = {
@@ -160,7 +162,13 @@ class HFBackend:
             self.device = torch.device(target)
         self.model.eval()
         self.layers = self._resolve_layers()
-        self.down_projs = [self._down_proj(layer) for layer in self.layers]
+        self.is_moe = any(self._is_moe(layer) for layer in self.layers)
+        self.num_experts = 0
+        if self.is_moe:
+            self.num_experts = max(self._count_experts(layer) for layer in self.layers)
+            self.down_projs = [None for _ in self.layers]  # type: ignore[list-item]
+        else:
+            self.down_projs = [self._down_proj(layer) for layer in self.layers]
         self._validate_shapes()
 
     # ------------------------------------------------------------------ loading
@@ -193,7 +201,10 @@ class HFBackend:
                 continue
             if not all(hasattr(layer, "mlp") for layer in module):
                 continue
-            if not all(self._find_down_proj(layer) is not None for layer in module):
+            if not all(
+                self._find_down_proj(layer) is not None or self._is_moe(layer)
+                for layer in module
+            ):
                 continue
             score = 0
             if "language_model" in name:
@@ -225,13 +236,64 @@ class HFBackend:
                 return module
         return None
 
+    @staticmethod
+    def _is_moe(layer: Any) -> bool:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            return False
+        experts = getattr(mlp, "experts", None)
+        if isinstance(experts, (nn.ModuleList, list, tuple)) and len(experts) > 0:
+            return True
+        # Newer fused MoE blocks store all experts in stacked tensors.
+        if experts is not None and hasattr(experts, "num_experts"):
+            try:
+                if int(experts.num_experts) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        # Some implementations nest the sparse block one level deeper.
+        block = getattr(mlp, "block_sparse_moe", None)
+        if block is not None:
+            nested = getattr(block, "experts", None)
+            return isinstance(nested, (nn.ModuleList, list, tuple)) and len(nested) > 0
+        return False
+
+    @staticmethod
+    def _count_experts(layer: Any) -> int:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            return 0
+        experts = getattr(mlp, "experts", None)
+        if isinstance(experts, (nn.ModuleList, list, tuple)):
+            return len(experts)
+        if experts is not None and hasattr(experts, "num_experts"):
+            try:
+                return int(experts.num_experts)
+            except (TypeError, ValueError):
+                return 0
+        block = getattr(mlp, "block_sparse_moe", None)
+        if block is not None:
+            nested = getattr(block, "experts", None)
+            if isinstance(nested, (nn.ModuleList, list, tuple)):
+                return len(nested)
+        return 0
+
     def _down_proj(self, layer: Any) -> Any:
         module = self._find_down_proj(layer)
         if module is None:
+            if self._is_moe(layer):
+                raise RuntimeError(
+                    "MoE layers have per-expert down projections; use dense residual "
+                    "steering (method='dense')"
+                )
             raise RuntimeError("layer has no down projection")
         return module
 
     def _validate_shapes(self) -> None:
+        if self.is_moe:
+            # Dense residual steering does not need the expert width.  The
+            # config's moe_intermediate_size (when present) is already recorded.
+            return
         weight = self.down_projs[0].weight
         if weight.ndim != 2:
             raise RuntimeError(f"down projection weight must be 2-D, got {tuple(weight.shape)}")
@@ -281,6 +343,8 @@ class HFBackend:
             "parameters": ref.num_parameters,
             "device": str(self.device),
             "dtype": ref.dtype,
+            "moe": self.is_moe,
+            "num_experts": self.num_experts,
         }
 
     # ------------------------------------------------------------------ prompts
@@ -441,6 +505,11 @@ class HFBackend:
         max_examples: int | None = None,
         max_length: int | None = None,
     ) -> NeuronStats:
+        if self.is_moe:
+            raise RuntimeError(
+                "expert-neuron capture is not implemented; MoE models use dense "
+                "residual steering"
+            )
         selected = list(examples[: max_examples or len(examples)])
         layers = sorted(set(layers))
         intermediate = int(self.intermediate_size)
@@ -506,6 +575,11 @@ class HFBackend:
         Positive values mean that increasing the neuron's activation raises the
         log-probability of positive responses relative to negative ones.
         """
+        if self.is_moe:
+            raise RuntimeError(
+                "expert-neuron attribution is not implemented; MoE models use dense "
+                "residual steering"
+            )
         selected = list(examples[: max_examples or len(examples)])
         layers = sorted(set(layers))
         intermediate = int(self.intermediate_size)
@@ -606,6 +680,8 @@ class HFBackend:
     def neuron_delta_vector(
         self, layer: int, neurons: Sequence[int], deltas: Sequence[float]
     ) -> np.ndarray:
+        if self.is_moe:
+            raise RuntimeError("MoE models use dense residual vectors, not neuron deltas")
         weight = self.down_projs[layer].weight.detach().float().cpu().numpy()
         if not len(neurons) == len(deltas):
             raise ValueError("neurons and deltas must have the same length")
@@ -613,6 +689,8 @@ class HFBackend:
         return columns.astype(np.float64) @ np.asarray(deltas, dtype=np.float64)
 
     def dose_to_delta(self, layer: int, neuron: int, dose: float, median_norm: float) -> float:
+        if self.is_moe:
+            raise RuntimeError("MoE models use dense residual vectors, not neuron deltas")
         weight = self.down_projs[layer].weight.detach().float().cpu().numpy()
         norm = float(np.linalg.norm(weight[:, neuron]))
         if norm == 0:
@@ -836,10 +914,15 @@ class HFBackend:
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
-        del self.model
+        # Drop every strong reference to the modules; otherwise a Modal
+        # container reused for the next model keeps the previous one on the GPU.
+        self.layers = []
+        self.down_projs = []
+        self.model = None
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def __enter__(self) -> HFBackend:
         return self

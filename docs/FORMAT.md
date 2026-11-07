@@ -76,6 +76,10 @@ are mathematically equivalent for a constant per-token delta.
 Layer 0 can be used by the Transformers backend. llama.cpp control vectors
 cannot target layer 0, so the exporter skips it with a warning.
 
+For MoE models the vectors are still dense residual deltas; no expert index is
+stored. Expert-specific neuron edits are intentionally not part of the format
+because a llama.cpp control vector cannot represent token-dependent routing.
+
 ## `eval`
 
 Trait scores are 0-1, not percentages. `ppl_ratio` is steered perplexity divided

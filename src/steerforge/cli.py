@@ -76,6 +76,19 @@ def _parse_layers(value: str) -> str:
     return value.strip() or "auto"
 
 
+def _warn_research_only(name: str) -> None:
+    lowered = name.lower()
+    if any(word in lowered for word in ("evil", "malicious", "hostile", "violent")):
+        console.print(
+            Panel(
+                "This persona is a research artifact. Do not connect it to tools, "
+                "real accounts, or anything that can act without human approval.",
+                title="research-only persona",
+                border_style="yellow",
+            )
+        )
+
+
 def _backend_or_die(name: str | None, command: str | None) -> str:
     if command:
         detected = normalize_backend(name) or detect_backend(shlex.split(command))
@@ -151,6 +164,8 @@ def doctor() -> None:
         add("cuda", False, "torch not installed")
     server = find_llama_server()
     add("llama-server", bool(server), server or "not on PATH")
+    mlx_spec = importlib.util.find_spec("mlx_lm")
+    add("mlx-lm", mlx_spec is not None, "Apple Silicon only" if mlx_spec is None else "installed")
     add("vllm", importlib.util.find_spec("vllm") is not None, "steering requires EasySteer fork")
     add("steerforge", True, __version__)
     console.print(table)
@@ -252,8 +267,9 @@ def dataset_command(
 
 @app.command("discover")
 def discover_command(
-    model: str = typer.Option(..., "--model", "-m", help="HF model id or local path."),
+    model: str = typer.Option(..., "--model", "-m", help="HF/MLX model id or local path."),
     trait: str = typer.Option(..., "--trait", help="Persona name, e.g. evil."),
+    backend_kind: str = typer.Option("hf", "--backend", help="Discovery backend: hf | mlx."),
     dataset: Path | None = typer.Option(None, "--dataset", help="Contrastive JSONL dataset."),
     spec_path: Path | None = typer.Option(None, "--spec", help="Trait YAML spec; can synthesize the dataset."),
     prompts: Path | None = typer.Option(None, "--prompts", help="Prompt file for synthesis."),
@@ -293,17 +309,29 @@ def discover_command(
     if method not in ("neuron", "dense", "hybrid"):
         raise typer.BadParameter("--method must be neuron, dense, or hybrid")
     out_path = out or Path(f"{safe_name(trait)}.persona")
-    backend = HFBackend(
-        model,
-        revision=revision,
-        device=device,
-        dtype=dtype,
-        trust_remote_code=trust_remote_code,
-        load_in_4bit=load_in_4bit,
-        tokenizer_id=tokenizer,
-        threads=threads,
-        verbose=True,
-    )
+    backend_kind = backend_kind.lower()
+    if backend_kind == "mlx":
+        from .mlx_backend import MLXBackend
+
+        backend = MLXBackend(
+            model,
+            trust_remote_code=trust_remote_code,
+            verbose=True,
+        )
+    elif backend_kind in ("hf", "transformers"):
+        backend = HFBackend(
+            model,
+            revision=revision,
+            device=device,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            load_in_4bit=load_in_4bit,
+            tokenizer_id=tokenizer,
+            threads=threads,
+            verbose=True,
+        )
+    else:
+        raise typer.BadParameter("--backend must be hf or mlx for discovery")
     try:
         if dataset:
             examples = load_dataset(dataset)
@@ -523,6 +551,7 @@ def apply_command(
     from .hf import HFBackend
 
     persona = load_persona(persona_path)
+    _warn_research_only(persona.trait.name)
     if not persona.vectors:
         console.print("[yellow]persona has no vectors; this will be the baseline model[/yellow]")
     backend = HFBackend(
@@ -553,7 +582,9 @@ def apply_command(
 @app.command("serve")
 def serve_command(
     persona_path: Path = typer.Argument(..., exists=True, readable=True),
-    backend_name: str | None = typer.Option(None, "--backend", help="llama.cpp | transformers | vllm"),
+    backend_name: str | None = typer.Option(
+        None, "--backend", help="llama.cpp | transformers | vllm | mlx"
+    ),
     model: str | None = typer.Option(None, "--model", help="Override model path/id."),
     command: str | None = typer.Option(None, "--command", help="Existing server command."),
     host: str | None = typer.Option(None, "--host"),
@@ -572,6 +603,7 @@ def serve_command(
 ) -> None:
     """Launch an inference server with the persona already applied."""
     persona = load_persona(persona_path)
+    _warn_research_only(persona.trait.name)
     effective = persona if scale == 1.0 else persona.scaled(scale)
     if not no_steer and not effective.vectors:
         console.print("[red]persona contains no vectors[/red]")
@@ -624,6 +656,25 @@ def serve_command(
         )
         active = effective if not no_steer else effective.model_copy(update={"vectors": {}})
         web = create_app(hf, active, api_key=api_key)
+        import uvicorn
+
+        uvicorn.run(
+            web,
+            host=resolved_host or "127.0.0.1",
+            port=resolved_port or 8080,
+            log_level="info",
+        )
+        return
+
+    if backend == "mlx":
+        from .mlx_backend import MLXBackend
+        from .openai_server import create_app
+
+        model_id = model or (persona.serve.model if persona.serve else None) or persona.base_model.id
+        console.print(f"loading [bold]{model_id}[/bold] with MLX")
+        mlx = MLXBackend(model_id, trust_remote_code=trust_remote_code, verbose=True)
+        active = effective if not no_steer else effective.model_copy(update={"vectors": {}})
+        web = create_app(mlx, active, api_key=api_key)
         import uvicorn
 
         uvicorn.run(

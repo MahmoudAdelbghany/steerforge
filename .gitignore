@@ -10,3 +10,4 @@ dist/
 htmlcov/
 .steerforge/
 *.report.json
+results/

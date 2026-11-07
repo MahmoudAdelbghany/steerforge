@@ -87,8 +87,11 @@ so. A persona that only damages the model is not a result.
   formatting, the direction may encode style instead of the trait. Match them.
 - **One-layer models** — a single layer may not be enough to separate a complex
   persona. Widen `--layers`.
-- **Architecture coverage** — discovery needs a dense MLP with a `down_proj`
-  (Qwen/Llama family). MoE models and exotic architectures are not supported yet.
+- **Architecture coverage** — neuron-level discovery needs a dense MLP with a
+  `down_proj` (Qwen/Llama family). MoE models use the dense residual path
+  automatically; expert-neuron recipes are not exposed because they are not
+  portable. MLX uses dense residual steering only; its lazy graph has no
+  PyTorch-style backward hooks.
 
 ## Cost
 

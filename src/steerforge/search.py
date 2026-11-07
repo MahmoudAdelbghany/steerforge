@@ -666,12 +666,35 @@ class Discovery:
         if cfg.max_examples:
             self.examples = self.examples[: cfg.max_examples]
         self.backend.max_length = cfg.max_length
-        cfg.say(f"trait={self.trait!r} layers={self.layers} method={cfg.method}")
-        dense_candidates = self.capture_dense() if cfg.method in ("dense", "hybrid") else []
-        neuron_candidates = self.rank_neurons() if cfg.method in ("neuron", "hybrid") else []
-        pool = neuron_candidates if cfg.method != "dense" else dense_candidates
+        method = cfg.method
+        supports_neuron = getattr(self.backend, "supports_neuron", True)
+        if (getattr(self.backend, "is_moe", False) or not supports_neuron) and method != "dense":
+            reason = (
+                "MoE model detected: expert-neuron edits are not portable"
+                if getattr(self.backend, "is_moe", False)
+                else "this backend supports dense residual steering only"
+            )
+            cfg.say(f"{reason}; using dense residual steering")
+            method = "dense"
+        cfg.say(f"trait={self.trait!r} layers={self.layers} method={method}")
+        dense_candidates = self.capture_dense() if method in ("dense", "hybrid") else []
+        neuron_candidates = self.rank_neurons() if method in ("neuron", "hybrid") else []
+        pool = neuron_candidates if method != "dense" else dense_candidates
         self.build_probe()
         screened = self.screen(pool)
+        if method == "hybrid" and dense_candidates:
+            # Hybrid must not be worse than dense: put the best dense
+            # directions into the validation shortlist alongside the neurons.
+            combined = list(screened) + list(dense_candidates[: cfg.validate_candidates])
+            seen: set[tuple[str, int, int | None]] = set()
+            deduped = []
+            for item in sorted(combined, key=lambda c: c.screen, reverse=True):
+                key = (item.kind, item.layer, item.neuron)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+            screened = deduped
         if not screened and dense_candidates:
             screened = dense_candidates[: cfg.validate_candidates]
         if not screened:
@@ -695,9 +718,14 @@ class Discovery:
             selected = []
         else:
             selected = [validated[0]]
-            if cfg.method in ("neuron", "hybrid"):
+            if method in ("neuron", "hybrid"):
                 selected = self.greedy(validated[0], validated[1 : 1 + cfg.greedy_pool])
-        if cfg.method == "hybrid" and dense_candidates and selected:
+        if (
+            method == "hybrid"
+            and dense_candidates
+            and selected
+            and all(cand.kind != "dense" for cand in selected)
+        ):
             # Try mixing the best dense direction into the neuron recipe.
             dense_seed = dense_candidates[0]
             trial = selected + [dense_seed]
@@ -746,6 +774,7 @@ class Discovery:
                     )
                 )
         report = self.final_eval(selected)
+        report.method = method
         report.elapsed_seconds = time.perf_counter() - started
         cfg.say(
             f"done in {format_duration(report.elapsed_seconds)}: trait={report.trait_score:.3f} "
@@ -763,7 +792,7 @@ class Discovery:
                 dataset_sha256=dataset_hash(self.examples),
                 num_examples=len(self.examples),
                 keywords=keywords,
-                source="contrastive-dataset",
+                source="dense-moe" if getattr(self.backend, "is_moe", False) else "contrastive-dataset",
             ),
             interventions=interventions,
             vectors={
@@ -772,7 +801,7 @@ class Discovery:
             },
             eval=report,
             search=SearchMeta(
-                method=cfg.method,
+                method=method,
                 layers=list(self.layers),
                 max_candidates=cfg.max_candidates,
                 screen_candidates=cfg.screen_candidates,
@@ -790,6 +819,11 @@ class Discovery:
                 + (
                     " No candidate beat the baseline during search; this persona is empty."
                     if no_improvement
+                    else ""
+                )
+                + (
+                    " MoE model: this persona uses a dense residual vector, not expert-neuron edits."
+                    if getattr(self.backend, "is_moe", False)
                     else ""
                 )
             ),
